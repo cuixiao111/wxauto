@@ -1,6 +1,6 @@
 """
-Author: Cluic
-Update: 2024-07-22
+Author: Cluic/cuixiao111
+Update: 2025-05-30
 Version: 3.9.11.17.4
 """
 
@@ -166,7 +166,7 @@ class WeChat(WeChatBase):
             sessionname (str): 聊天对象名
             amount (int): 新消息条数
         """
-        matchobj = re.search('\d+条新消息', SessionItem.Name)
+        matchobj = re.search(r'\d+条新消息', SessionItem.Name)
         amount = 0
         if matchobj:
             try:
@@ -304,36 +304,54 @@ class WeChat(WeChatBase):
         '''打开某个聊天框
         
         Args:
-            who ( str ): 要打开的聊天框好友名;  * 最好完整匹配，不完全匹配只会选取搜索框第一个
-            timeout ( num, optional ): 超时时间，默认2秒
+            who (str): 要打开的聊天框好友名，可以包含emoji
+            timeout (num, optional): 超时时间，默认2秒
             
         Returns:
-            chatname ( str ): 匹配值第一个的完整名字
+            str: 匹配到的完整聊天对象名
         '''
         self._show()
         sessiondict = self.GetSessionList(True)
+        
+        # 首先尝试直接匹配会话列表中的项目
         if who in list(sessiondict.keys())[:-1]:
-            self.SessionBox.ListItemControl(RegexName=who).Click(simulateMove=False)
+            self.SessionBox.ListItemControl(RegexName=re.escape(who)).Click(simulateMove=False)
+            return who
+        
+        # 如果不在当前会话列表，使用搜索功能
+        self.UiaAPI.SendKeys('{Ctrl}f', waitTime=1)
+        
+        # 特殊处理包含emoji的搜索
+        if any(ord(c) > 0xffff for c in who):  # 检测是否包含emoji等特殊字符
+            # 使用剪贴板方式输入emoji
+            SetClipboardText(who)
+            self.B_Search.SendKeys('{Ctrl}v', waitTime=1.5)
+        else:
+            self.B_Search.SendKeys(who, waitTime=1.5)
+        
+        # 放宽匹配条件，不依赖<em>标签
+        target_control = self.SessionBox.TextControl(SubName=who)
+        if target_control.Exists(timeout):
+            wxlog.debug('选择匹配项')
+            target_control.Click(simulateMove=False)
             return who
         else:
-            self.UiaAPI.SendKeys('{Ctrl}f', waitTime=1)
-            self.B_Search.SendKeys(who, waitTime=1.5)
-            target_control = self.SessionBox.TextControl(Name=f"<em>{who}</em>")
-            if target_control.Exists(timeout):
-                wxlog.debug('选择完全匹配项')
-                target_control.Click(simulateMove=False)
-                return who
-            else:
-                search_result_control = self.SessionBox.GetChildren()[1].GetChildren()[1].GetFirstChildControl()
-                if not search_result_control.PaneControl(searchDepth=1).TextControl(RegexName='联系人|群聊').Exists(0.1):
-                    wxlog.debug(f'未找到搜索结果: {who}')
-                    self._refresh()
-                    return False
-                wxlog.debug('选择搜索结果第一个')
-                target_control = search_result_control.Control(RegexName=f'.*{who}.*')
-                chatname = target_control.Name
-                target_control.Click(simulateMove=False)
-                return chatname
+            search_result_control = self.SessionBox.GetChildren()[1].GetChildren()[1].GetFirstChildControl()
+            if not search_result_control.PaneControl(searchDepth=1).TextControl(RegexName='联系人|群聊').Exists(0.1):
+                wxlog.debug(f'未找到搜索结果: {who}')
+                self._refresh()
+                return False
+            
+            # 使用更宽松的匹配方式
+            wxlog.debug('尝试宽松匹配')
+            for control in search_result_control.GetChildren():
+                if who in control.Name:
+                    control.Click(simulateMove=False)
+                    return control.Name
+            
+            wxlog.debug('未找到匹配项')
+            self._refresh()
+            return False
     
     def AtAll(self, msg=None, who=None):
         """@所有人
@@ -487,7 +505,62 @@ class WeChat(WeChatBase):
         else:
             Warnings.lightred('所有文件都无法成功发送', stacklevel=2)
             return False
+
+    def AtAll(self, msg=None, who=None):
+        """@所有人并发送消息
+        
+        Args:
+            msg (str, optional): 要发送的文本消息，如果不提供则只@所有人不发送消息
+            who (str, optional): 要发送的群聊名称，如果为None则发送到当前聊天页面
             
+        Returns:
+            bool: 是否成功执行@所有人操作
+            
+        Example:
+            >>> who = '工作群'
+            >>> msg = '通知：今天下午3点开会'
+            >>> wx.AtAll(msg=msg, who=who)
+        """
+        # 定位到目标聊天窗口
+        if who:
+            try:
+                editbox = self.ChatBox.EditControl(searchDepth=10)
+                if who not in self.CurrentChat() or who not in editbox.Name:
+                    self.ChatWith(who)
+                    editbox = self.ChatBox.EditControl(Name=who, searchDepth=10)
+            except:
+                self.ChatWith(who)
+                editbox = self.ChatBox.EditControl(Name=who, searchDepth=10)
+        else:
+            editbox = self.ChatBox.EditControl(searchDepth=10)
+        
+        # 确保输入框获得焦点
+        self._show()
+        if not editbox.HasKeyboardFocus:
+            editbox.Click(simulateMove=False)
+        
+        # 执行@所有人操作
+        editbox.SendKeys('@')
+        time.sleep(0.5)  # 等待@菜单弹出
+        
+        atwnd = self.UiaAPI.PaneControl(ClassName='ChatContactMenu')
+        if atwnd.Exists(maxSearchSeconds=1):
+            # 查找并点击"所有人"选项
+            all_member_item = atwnd.ListItemControl(Name='所有人')
+            if all_member_item.Exists(maxSearchSeconds=0.5):
+                all_member_item.Click(simulateMove=False)
+                
+                # 如果有消息内容则发送
+                if msg:
+                    if not msg.startswith('\n'):
+                        msg = '\n' + msg  # 确保消息在新行
+                    self.SendMsg(msg, who=who, clear=False)  # 不清空已@的内容
+                return True
+        
+        # 如果@所有人失败
+        Warnings.lightred(f'在群 [{who}] 中@所有人失败，可能不是群聊或没有权限', stacklevel=2)
+        return False
+
     def GetAllMessage(self, savepic=False, savefile=False, savevoice=False):
         '''获取当前窗口中加载的所有聊天记录
         
